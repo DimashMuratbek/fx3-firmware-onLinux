@@ -14,7 +14,7 @@
 ## installation root directory path.
 ##
 
-FX3FWROOT=../../..
+FX3FWROOT=/home/dimash/Downloads/Cypress_SDK/Cypress/cyfx3sdk
 
 all:compile
 
