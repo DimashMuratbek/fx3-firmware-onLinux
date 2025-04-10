@@ -53,9 +53,6 @@ CyU3PDmaChannel glDmaChHandle;
 CyU3PDmaChannel glLoopOutChHandle;
 CyU3PDmaChannel glLoopInChHandle;
 
-CyU3PDmaChannel glChHandleGpifToUsb;
-
-
 CyBool_t glIsApplnActive = CyFalse;     /* Whether the application is active or not. */
 CyBool_t glForceLinkU2   = CyFalse;     /* Whether the device should try to initiate U2 mode. */
 
@@ -72,12 +69,6 @@ volatile CyBool_t glRstRqt = CyFalse;
 uint8_t *gl_UsbLogBuffer = NULL;
 
 static volatile uint32_t BulkEpEvtCount = 0;    /* Number of endpoint events received on streaming endpoint. */
-
-
-#define NUM_SAMPLES 128
-#define VREF 3.3
-#define NUM_CYCLES 4
-static float phase = 0.0f;
 
 /* Application Error Handler */
 void
@@ -152,21 +143,38 @@ CyFxApplnDebugInit (void)
 }
 uint32_t glProdCount = 0;
 uint32_t glConsCount = 0;
+
 void
-GpifToUsbDmaCallback (
-        CyU3PDmaChannel   *chHandle,
-        CyU3PDmaCbType_t   type,
-        CyU3PDmaCBInput_t *input)
+GpifToUsbDmaCallback (CyU3PDmaChannel   *chHandle, CyU3PDmaCbType_t   type, CyU3PDmaCBInput_t *input)
 {
     if (type == CY_U3P_DMA_CB_PROD_EVENT)
-        {
-    		glProdCount++;
-        }
-    else if (type == CY_U3P_DMA_CB_CONS_EVENT)
-        {
-        	glConsCount++;
-        }
+    {
+    	CyU3PDmaBuffer_t dmaBuf;
+    	CyU3PReturnStatus_t status;
+        status = CyU3PDmaChannelGetBuffer(&glDmaChHandle, &dmaBuf, CYU3P_NO_WAIT);
+               // CYU3P_WAIT_FOREVER
+               if (status != CY_U3P_SUCCESS)
+               {
+               	CyU3PDebugPrint(4, "DMA buffer not ready: 0x%x\n", status);
+               	return;
+               }
+               // Fill buffer with data pattern
+                    uint8_t *ptr = dmaBuf.buffer;
+                    for (int i = 0; i < dmaBuf.size / 33; i++) { // 32 digital + 1 analog
+                        // Digital channels (32 bytes)
+                        memset(ptr, 0, 32); // Or actual digital data
+                        ptr += 32;
+
+                        // Analog channel (1 byte)
+                        *ptr++ = 128; // Constant 1.65V (mid-scale)
+
+                    }
+
+                    dmaBuf.count = (dmaBuf.size / 33) * 33; // Complete samples
+                    CyU3PDmaChannelCommitBuffer(&glDmaChHandle, dmaBuf.count, 0);
+               }
 }
+
 
 
 /* Endpoint specific event callback. For now, we only keep a count of the endpoint events that occur. */
@@ -200,15 +208,22 @@ CyFxApplnStart (uint16_t samplingFactor)
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
     CyU3PUSBSpeed_t usbSpeed = CyU3PUsbGetSpeed();
 
-    CyU3PPibClock_t pibClk = {samplingFactor, CyFalse, CyFalse, CY_U3P_SYS_CLK};
+    /* Optimize PIB clock for 32 channels */
+    CyU3PPibClock_t pibClk = {
+        samplingFactor,    /* Clock divider */
+        CyFalse,          /* No clock inversion */
+        CyFalse,          /* No clock delay */
+        CY_U3P_SYS_CLK    /* Use system clock */
+    };
 
-    /* Initialize the PIB block. */
-    apiRetStatus = CyU3PPibInit (CyTrue, &pibClk);
+    /* Initialize the PIB block with optimized settings */
+    apiRetStatus = CyU3PPibInit(CyTrue, &pibClk);
     if (apiRetStatus != CY_U3P_SUCCESS)
     {
-        CyU3PDebugPrint (4, "PIB Init failed, error code = %d\r\n", apiRetStatus);
-        CyFxAppErrorHandler (apiRetStatus);
+        CyU3PDebugPrint(4, "PIB Init failed, error code = %d\r\n", apiRetStatus);
+        CyFxAppErrorHandler(apiRetStatus);
     }
+
 
     /* First identify the usb speed. Once that is identified,
      * create a DMA channel and start the transfer on this. */
@@ -227,7 +242,7 @@ CyFxApplnStart (uint16_t samplingFactor)
     case  CY_U3P_SUPER_SPEED:
         /* Disable USB link low power entry to optimize USB throughput. */
         CyU3PUsbLPMDisable();
-        size = 1024;
+        size = 1024;  /* Maximum packet size for SuperSpeed */
         break;
 
     default:
@@ -239,7 +254,7 @@ CyFxApplnStart (uint16_t samplingFactor)
     CyU3PMemSet ((uint8_t *)&epCfg, 0, sizeof (epCfg));
     epCfg.enable = CyTrue;
     epCfg.epType = CY_U3P_USB_EP_BULK;
-    epCfg.burstLen = (usbSpeed == CY_U3P_SUPER_SPEED) ? (CY_FX_EP_BURST_LENGTH) : 1;
+    epCfg.burstLen = (usbSpeed == CY_U3P_SUPER_SPEED) ? 16 : 1;  /* Increased burst length for SuperSpeed */
     epCfg.streams = 0;
     epCfg.pcktSize = size;
 
@@ -266,9 +281,9 @@ CyFxApplnStart (uint16_t samplingFactor)
 
     /* Create a DMA AUTO channel for the GPIF to USB transfer. */
     CyU3PMemSet ((uint8_t *)&dmaCfg, 0, sizeof (dmaCfg));
-    dmaCfg.size  = CY_FX_DMA_BUF_SIZE;
-    dmaCfg.count = CY_FX_DMA_BUF_COUNT;
-    dmaCfg.prodSckId = CY_FX_GPIF_PRODUCER_SOCKET;
+    dmaCfg.size  = CY_FX_DMA_BUF_SIZE ;  /* Doubled buffer size for better throughput */
+    dmaCfg.count = CY_FX_DMA_BUF_COUNT;  /* Doubled buffer count for better buffering */
+    dmaCfg.prodSckId = CY_U3P_CPU_SOCKET_PROD;  // CY_FX_GPIF_PRODUCER_SOCKET  CY_U3P_CPU_SOCKET_PROD
     dmaCfg.consSckId = CY_FX_EP_CONSUMER_SOCKET;
     dmaCfg.dmaMode = CY_U3P_DMA_MODE_BYTE;
     dmaCfg.prodHeader = 0;
@@ -277,17 +292,9 @@ CyFxApplnStart (uint16_t samplingFactor)
     dmaCfg.prodAvailCount = 0;
     dmaCfg.notification = CY_U3P_DMA_CB_CONS_SUSP|CY_U3P_DMA_CB_PROD_EVENT | CY_U3P_DMA_CB_CONS_EVENT;
     dmaCfg.cb = GpifToUsbDmaCallback;
-    apiRetStatus = CyU3PDmaChannelCreate (&glChHandleGpifToUsb, CY_U3P_DMA_TYPE_AUTO_SIGNAL, &dmaCfg);
+    apiRetStatus = CyU3PDmaChannelCreate (&glDmaChHandle, CY_U3P_DMA_TYPE_MANUAL_OUT, &dmaCfg); //CY_U3P_DMA_TYPE_AUTO_SIGNAL
 
 
-    if (apiRetStatus == CY_U3P_SUCCESS)
-    {
-        CyU3PDebugPrint(4, "DMA Channel Create OK\n");
-    }
-    else
-    {
-        CyU3PDebugPrint(4, "DMA Channel Create FAILED! Code: 0x%x\n", apiRetStatus);
-    }
 
     if (apiRetStatus != CY_U3P_SUCCESS)
     {
@@ -296,21 +303,7 @@ CyFxApplnStart (uint16_t samplingFactor)
     }
 
     /* Set DMA Channel transfer size */
-    apiRetStatus = CyU3PDmaChannelSetXfer (&glChHandleGpifToUsb, CY_FX_GPIFTOUSB_DMA_TX_SIZE);
-
-
-
-    if (apiRetStatus == CY_U3P_SUCCESS)
-    {
-        CyU3PDebugPrint(4, "DMA Channel SetXfer OK\n");
-    }
-    else
-    {
-        CyU3PDebugPrint(4, "DMA Channel SetXfer FAILED! Code: 0x%x\n", apiRetStatus);
-    }
-
-
-
+    apiRetStatus = CyU3PDmaChannelSetXfer (&glDmaChHandle, CY_FX_GPIFTOUSB_DMA_TX_SIZE);
     if (apiRetStatus != CY_U3P_SUCCESS)
     {
         CyU3PDebugPrint (4, "CyU3PDmaChannelSetXfer failed, Error code = %d\n", apiRetStatus);
@@ -421,11 +414,6 @@ CyFxApplnUSBSetupCB (
             	CyU3PDebugPrint(0,"Start Command, wLength = %d\r\n",wLength);
             	CyU3PUsbGetEP0Data(wLength, glEp0Buffer, NULL);
             	CyU3PDebugPrint(0,"glEp0Buffer[0]=%d\r\n",glEp0Buffer[0]);
-
-            	CyFxApplnStart(glEp0Buffer[0]);
-            	CyU3PDebugPrint(4, "Application started.\n");
-
-
                 if (glIsApplnActive)
                 {
                     CyFxApplnStop ();
@@ -433,6 +421,7 @@ CyFxApplnUSBSetupCB (
                 /*glEp0Buffer[0] should be the factor by which the 400MHZ clock should be divided*/
                 CyFxApplnStart(glEp0Buffer[0]);
             	isHandled = CyTrue;
+            	CyU3PDmaChannelSetXfer(&glDmaChHandle, 0);
                 break;
 
             case CMD_GET_FW_VERSION:
@@ -722,46 +711,10 @@ void printGpifToUSBDMAStats()
 	glConsCount = 0;
 }
 
-
-// **************************************************************
-
-
-
-void CreateAnalogSignal(uint8_t* buffer)
-{
-	for (int i = 0; i < NUM_SAMPLES; i++) {
-	        //float t = ((float)i / NUM_SAMPLES) * NUM_CYCLES;
-	        //float voltage = (sinf(2 * 3.14159f * t) + 1.0f) / 2.0f * VREF; // 0 to 3.3V
-	        // float voltage = 1.65f;
-	        //uint16_t adc = (uint16_t)((voltage / VREF) * 1023.0f);
-
-			/*uint16_t adc = 511;
-
-	        // buffer[3 * i + 0] = 0x00;           // Digital byte (can be fake)
-	        buffer[2 * i + 0] = adc & 0xFF;     // LSB
-	        buffer[2 * i + 1] = adc >> 8;       // MSB
-	        */
-
-	        uint16_t adc = 0xABCD;
-
-	        buffer[2 * i + 0] = adc & 0xFF;     // 0xCD
-	        buffer[2 * i + 1] = adc >> 8;       // 0xAB
-	}
-
-	CyU3PDebugPrint(4, "Sent ADC sample: 0x%02X %02X\n", buffer[0], buffer[1]);
-
-}
-
-// *********************************************************
-
-
-
-
 /* Entry function for the glAppThread. */
 void
 CyFxAppThread_Entry (uint32_t input)
 {
-
     /* Initialize the debug module */
     CyFxApplnDebugInit();
 
@@ -772,40 +725,53 @@ CyFxAppThread_Entry (uint32_t input)
     while (!glIsApplnActive)
         CyU3PThreadSleep (100);
 
+    CyU3PDebugPrint(4, "Entered AppThread main loop!\n");
     for (;;)
     {
-    	CyU3PDmaBuffer_t dmaBuf;
 
-    	CyU3PReturnStatus_t status;
-    	status = CyU3PDmaChannelGetBuffer (&glChHandleGpifToUsb, &dmaBuf, CYU3P_WAIT_FOREVER);
+    	 printGpifToUSBDMAStats();  // Optional debug
+    	 CyU3PThreadSleep(1000);    // Adjust timing as needed
 
-    	if (status != CY_U3P_SUCCESS) {
-    	    CyU3PDebugPrint(4, "Failed to get DMA buffer! Status: 0x%x\n", status);
-    	} else {
-    	    CyU3PDebugPrint(4, "DMA buffer acquired.\n");
-    	}
-
-        if(status == CY_U3P_SUCCESS && glIsApplnActive && (glProdCount + glConsCount > 0))
-        {
-        	CreateAnalogSignal(dmaBuf.buffer); // Fill with fake data
-        	CyU3PDebugPrint(4, "Sent ADC sample: 0x%02X %02X\n", dmaBuf.buffer[0], dmaBuf.buffer[1]);
-            if (dmaBuf.buffer == NULL) {
-                   CyU3PDebugPrint(4, "dmaBuf.buffer is NULL!\n");
-               } else {
-                   CyU3PDebugPrint(4, "Buffer not null. First 2 bytes: 0x%02X 0x%02X\n", dmaBuf.buffer[0], dmaBuf.buffer[1]);
-               }
-
-
-        	dmaBuf.count = NUM_SAMPLES * 2;
-        	dmaBuf.status = 0;
-        	CyU3PDmaChannelCommitBuffer (&glChHandleGpifToUsb, dmaBuf.count, 0);
-        	printGpifToUSBDMAStats();
-
-        }
-        CyU3PThreadSleep (10);
+//        if(glIsApplnActive && (glProdCount + glConsCount > 0))
+//        {
+//        	printGpifToUSBDMAStats();
+//        }
+//        CyU3PThreadSleep (10);
     }
-}
 
+
+//    for (;;){
+//    	if (glIsApplnActive) {
+//            CyU3PDmaBuffer_t dmaBuf;
+//            CyU3PReturnStatus_t status;
+//
+//            status = CyU3PDmaChannelGetBuffer(&glDmaChHandle, &dmaBuf, CYU3P_NO_WAIT);
+//            // CYU3P_WAIT_FOREVER
+//            if (status != CY_U3P_SUCCESS)
+//            {
+//            	CyU3PDebugPrint(4, "DMA buffer not ready: 0x%x\n", status);
+//            }
+//            else
+//            {
+//                CyU3PDebugPrint(4, "Got DMA buffer at %p, size=%d\n", dmaBuf.buffer, dmaBuf.size);
+//
+//                // Send a constant voltage value (e.g., 1.65V out of 3.3V = half scale = 128)
+//                uint8_t constant_adc_value = 128;  // Half scale
+//                for (int i = 0; i < dmaBuf.size; ++i) {
+//                    dmaBuf.buffer[i] = constant_adc_value;
+//                }
+//
+//                dmaBuf.count = dmaBuf.size;
+//                dmaBuf.status = 0;
+//
+//                CyU3PDmaChannelCommitBuffer(&glDmaChHandle, dmaBuf.count, 0);
+//                CyU3PDebugPrint(4, "Committed %d constant bytes to USB\n", dmaBuf.count);
+//            }
+//        }
+//
+//    CyU3PThreadSleep(10);  // Throttle for timing
+//    }
+}
 
 
 /* Application define function which creates the threads. */
@@ -848,9 +814,6 @@ CyFxApplicationDefine (
 /*
  * Main function
  */
-
-
-
 int
 main (void)
 {
@@ -858,9 +821,6 @@ main (void)
     CyU3PReturnStatus_t status = CY_U3P_SUCCESS;
 
     /* Initialize the device */
-
-    /* When the GPIF data bus is configured as 32-bits wide and running at 100 MHz (synchronous),
-       the FX3 system clock has to be set to a frequency greater than 400 MHz. */
     CyU3PSysClockConfig_t clockConfig;
 
     clockConfig.setSysClk400  = CyTrue;
@@ -883,14 +843,20 @@ main (void)
     {
         goto handle_fatal_error;
     }
+    /* Configure the IO matrix for the device. On the FX3 DVK board, the COM port
+     * is connected to the IO(53:56). This means that either DQ32 mode should be
+     * selected or lppMode should be set to UART_ONLY. Here we are choosing
+     * UART_ONLY configuration for 16 bit slave FIFO configuration and setting
+     * isDQ32Bit for 32-bit slave FIFO configuration. */
+
 
     CyU3PMemSet ((uint8_t *)&io_cfg, 0, sizeof (io_cfg));
-    io_cfg.isDQ32Bit = CyTrue;  /*enable or disable 32 chnl*/
+    io_cfg.isDQ32Bit = CyTrue; /*CyFalse*/
     io_cfg.useUart   = CyTrue;
     io_cfg.useI2C    = CyFalse;
     io_cfg.useI2S    = CyFalse;
     io_cfg.useSpi    = CyFalse;
-    io_cfg.lppMode   = CY_U3P_IO_MATRIX_LPP_DEFAULT;    /*Uart only for 16 LPP default for 32*/
+    io_cfg.lppMode   = CY_U3P_IO_MATRIX_LPP_DEFAULT;  /*use CY_U3P_IO_MATRIX_LPP_UART_ONLY for 16*/
     io_cfg.s0Mode    = CY_U3P_SPORT_INACTIVE;
     io_cfg.s1Mode    = CY_U3P_SPORT_INACTIVE;
 
