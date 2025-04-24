@@ -176,6 +176,16 @@ GpifToUsbDmaCallback (CyU3PDmaChannel   *chHandle, CyU3PDmaCbType_t   type, CyU3
 }
 
 
+void MyDummyCallback(CyU3PDmaChannel *chHandle, CyU3PDmaCbType_t type, CyU3PDmaCBInput_t *input) {
+
+	    CyU3PDebugPrint(4, "DMA Callback HIT! Type: %d\n", type);
+
+	    if (type == CY_U3P_DMA_CB_PROD_EVENT)
+	        glProdCount++;
+	    if (type == CY_U3P_DMA_CB_CONS_EVENT)
+	        glConsCount++;
+
+}
 
 /* Endpoint specific event callback. For now, we only keep a count of the endpoint events that occur. */
 static void
@@ -291,10 +301,26 @@ CyFxApplnStart (uint16_t samplingFactor)
     dmaCfg.consHeader = 0;
     dmaCfg.prodAvailCount = 0;
     dmaCfg.notification = CY_U3P_DMA_CB_CONS_SUSP|CY_U3P_DMA_CB_PROD_EVENT | CY_U3P_DMA_CB_CONS_EVENT;
-    dmaCfg.cb = GpifToUsbDmaCallback;
+    dmaCfg.cb = MyDummyCallback;
     apiRetStatus = CyU3PDmaChannelCreate (&glDmaChHandle, CY_U3P_DMA_TYPE_MANUAL_OUT, &dmaCfg); //CY_U3P_DMA_TYPE_AUTO_SIGNAL
 
 
+	CyU3PDebugPrint(4,
+    	"DMA config:\r\n"
+    	"  prodSckId: %d\r\n"
+    	"  consSckId: %d\r\n"
+    	"  size: %d\r\n"
+    	"  count: %d\r\n"
+    	"  dmaMode: %d\r\n"
+    	"  prodHeader: %d\r\n"
+    	"  consHeader: %d\r\n"
+    	"  prodFooter: %d\r\n"
+    	"  prodAvailCount: %d\r\n"
+		"  cb: %d\r\n"
+    	"\r\n",
+    	dmaCfg.prodSckId, dmaCfg.consSckId, dmaCfg.size, dmaCfg.count,
+    	dmaCfg.dmaMode, dmaCfg.prodHeader, dmaCfg.consHeader,
+    	dmaCfg.prodFooter, dmaCfg.prodAvailCount, dmaCfg.cb);
 
     if (apiRetStatus != CY_U3P_SUCCESS)
     {
@@ -725,7 +751,7 @@ CyFxAppThread_Entry (uint32_t input)
     while (!glIsApplnActive)
         CyU3PThreadSleep (100);
 
-    CyU3PDebugPrint(4, "Entered AppThread main loop!\n");
+    CyU3PDebugPrint(4, "Entered AppThread main loop!\r\n");
     for (;;)
     {
 
