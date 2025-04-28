@@ -46,17 +46,18 @@
 #include "cyu3gpif.h"
 #include "cyfxgpif2config.h"
 
-#include <math.h>
-
 CyU3PThread     glAppThread;            /* Application thread structure */
 CyU3PDmaChannel glDmaChHandle;
+
+static CyU3PDmaChannel glUsbChannel;
+
 CyU3PDmaChannel glLoopOutChHandle;
 CyU3PDmaChannel glLoopInChHandle;
 
 CyBool_t glIsApplnActive = CyFalse;     /* Whether the application is active or not. */
 CyBool_t glForceLinkU2   = CyFalse;     /* Whether the device should try to initiate U2 mode. */
 
-uint8_t glEp0Buffer[64] __attribute__ ((aligned (32))); /* Local buffer used for vendor command handling. */
+uint16_t glEp0Buffer[64] __attribute__ ((aligned (32))); /* Local buffer used for vendor command handling. */
 volatile uint8_t  vendorRqtCnt = 0;
 volatile uint32_t underrunCnt = 0;
 volatile CyBool_t glRstRqt = CyFalse;
@@ -143,38 +144,67 @@ CyFxApplnDebugInit (void)
 }
 uint32_t glProdCount = 0;
 uint32_t glConsCount = 0;
+volatile CyU3PDmaCbType_t lastEvent = 0;
 
 void
-GpifToUsbDmaCallback (CyU3PDmaChannel   *chHandle, CyU3PDmaCbType_t   type, CyU3PDmaCBInput_t *input)
+GpifToUsbDmaCallback (
+        CyU3PDmaChannel   *chHandle,
+        CyU3PDmaCbType_t   type,
+        CyU3PDmaCBInput_t *input)
 {
+	lastEvent = type;
     if (type == CY_U3P_DMA_CB_PROD_EVENT)
-    {
-    	CyU3PDmaBuffer_t dmaBuf;
-    	CyU3PReturnStatus_t status;
-        status = CyU3PDmaChannelGetBuffer(&glDmaChHandle, &dmaBuf, CYU3P_NO_WAIT);
-               // CYU3P_WAIT_FOREVER
-               if (status != CY_U3P_SUCCESS)
-               {
-               	CyU3PDebugPrint(4, "DMA buffer not ready: 0x%x\n", status);
-               	return;
-               }
-               // Fill buffer with data pattern
-                    uint8_t *ptr = dmaBuf.buffer;
-                    for (int i = 0; i < dmaBuf.size / 33; i++) { // 32 digital + 1 analog
-                        // Digital channels (32 bytes)
-                        memset(ptr, 0, 32); // Or actual digital data
-                        ptr += 32;
-
-                        // Analog channel (1 byte)
-                        *ptr++ = 128; // Constant 1.65V (mid-scale)
-
-                    }
-
-                    dmaBuf.count = (dmaBuf.size / 33) * 33; // Complete samples
-                    CyU3PDmaChannelCommitBuffer(&glDmaChHandle, dmaBuf.count, 0);
-               }
+        {
+    		glProdCount++;
+        }
+    else if (type == CY_U3P_DMA_CB_CONS_EVENT)
+        {
+        	glConsCount++;
+        }
 }
 
+static void
+CyFxFpgaTestDmaCbk (
+        CyU3PDmaChannel   *handle,
+        CyU3PDmaCbType_t   cbType,
+        CyU3PDmaCBInput_t *cbInput)
+{
+    CyU3PDmaBuffer_t dmaInfo = {0};
+    CyU3PReturnStatus_t stat;
+
+    if (cbType == CY_U3P_DMA_CB_PROD_EVENT)
+    {
+            /* Wait for a free buffer to transmit the received data. The call
+             * will fail if there was an error or if the USB connection was reset / disconnected.
+             * In case of error invoke the error handler and in case of reset / disconnection,
+             * glIsApplnActive will be CyFalse;  */
+
+        stat = CyU3PDmaChannelGetBuffer (&glUsbChannel, &dmaInfo, CYU3P_WAIT_FOREVER);
+        if (stat != CY_U3P_SUCCESS)
+         {
+            CyU3PDebugPrint (2, "Failed to get free buffer on USB DMA channel: %d\r\n", stat);
+			return;
+		 }
+	    if(cbInput->buffer_p.count != 0)
+		{
+
+        /* Copy the data from the producer  gpif channel to the consumer USB channel.
+             * The cbInput->buffer_p.count holds the amount of valid data received. */
+        CyU3PMemCopy (dmaInfo.buffer, cbInput->buffer_p.buffer, cbInput->buffer_p.count);
+
+		/* One buffer has been filled with data. Commit it. */
+        stat = CyU3PDmaChannelCommitBuffer (&glUsbChannel, cbInput->buffer_p.count, 0);
+		if (stat != CY_U3P_SUCCESS)
+          {
+		    CyU3PDebugPrint (2, "Failed to commit buffer on USB DMA channel: %d\r\n", stat);
+			return;
+          }
+		}
+	}
+        /* Mark the input DMA buffer as empty. */
+        CyU3PDmaChannelDiscardBuffer (handle);
+
+}
 
 
 /* Endpoint specific event callback. For now, we only keep a count of the endpoint events that occur. */
@@ -208,22 +238,15 @@ CyFxApplnStart (uint16_t samplingFactor)
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
     CyU3PUSBSpeed_t usbSpeed = CyU3PUsbGetSpeed();
 
-    /* Optimize PIB clock for 32 channels */
-    CyU3PPibClock_t pibClk = {
-        samplingFactor,    /* Clock divider */
-        CyFalse,          /* No clock inversion */
-        CyFalse,          /* No clock delay */
-        CY_U3P_SYS_CLK    /* Use system clock */
-    };
+    CyU3PPibClock_t pibClk = {samplingFactor, CyFalse, CyFalse, CY_U3P_SYS_CLK};
 
-    /* Initialize the PIB block with optimized settings */
-    apiRetStatus = CyU3PPibInit(CyTrue, &pibClk);
+    /* Initialize the PIB block. */
+    apiRetStatus = CyU3PPibInit (CyTrue, &pibClk);
     if (apiRetStatus != CY_U3P_SUCCESS)
     {
-        CyU3PDebugPrint(4, "PIB Init failed, error code = %d\r\n", apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+        CyU3PDebugPrint (4, "PIB Init failed, error code = %d\r\n", apiRetStatus);
+        CyFxAppErrorHandler (apiRetStatus);
     }
-
 
     /* First identify the usb speed. Once that is identified,
      * create a DMA channel and start the transfer on this. */
@@ -242,7 +265,7 @@ CyFxApplnStart (uint16_t samplingFactor)
     case  CY_U3P_SUPER_SPEED:
         /* Disable USB link low power entry to optimize USB throughput. */
         CyU3PUsbLPMDisable();
-        size = 1024;  /* Maximum packet size for SuperSpeed */
+        size = 1024;
         break;
 
     default:
@@ -254,7 +277,7 @@ CyFxApplnStart (uint16_t samplingFactor)
     CyU3PMemSet ((uint8_t *)&epCfg, 0, sizeof (epCfg));
     epCfg.enable = CyTrue;
     epCfg.epType = CY_U3P_USB_EP_BULK;
-    epCfg.burstLen = (usbSpeed == CY_U3P_SUPER_SPEED) ? 16 : 1;  /* Increased burst length for SuperSpeed */
+    epCfg.burstLen = (usbSpeed == CY_U3P_SUPER_SPEED) ? (CY_FX_EP_BURST_LENGTH) : 1;
     epCfg.streams = 0;
     epCfg.pcktSize = size;
 
@@ -281,9 +304,9 @@ CyFxApplnStart (uint16_t samplingFactor)
 
     /* Create a DMA AUTO channel for the GPIF to USB transfer. */
     CyU3PMemSet ((uint8_t *)&dmaCfg, 0, sizeof (dmaCfg));
-    dmaCfg.size  = CY_FX_DMA_BUF_SIZE ;  /* Doubled buffer size for better throughput */
-    dmaCfg.count = CY_FX_DMA_BUF_COUNT;  /* Doubled buffer count for better buffering */
-    dmaCfg.prodSckId = CY_U3P_CPU_SOCKET_PROD;  // CY_FX_GPIF_PRODUCER_SOCKET  CY_U3P_CPU_SOCKET_PROD
+    dmaCfg.size  = CY_FX_DMA_BUF_SIZE;
+    dmaCfg.count = CY_FX_DMA_BUF_COUNT;
+    dmaCfg.prodSckId = CY_U3P_CPU_SOCKET_PROD;
     dmaCfg.consSckId = CY_FX_EP_CONSUMER_SOCKET;
     dmaCfg.dmaMode = CY_U3P_DMA_MODE_BYTE;
     dmaCfg.prodHeader = 0;
@@ -291,8 +314,26 @@ CyFxApplnStart (uint16_t samplingFactor)
     dmaCfg.consHeader = 0;
     dmaCfg.prodAvailCount = 0;
     dmaCfg.notification = CY_U3P_DMA_CB_CONS_SUSP|CY_U3P_DMA_CB_PROD_EVENT | CY_U3P_DMA_CB_CONS_EVENT;
-    dmaCfg.cb = GpifToUsbDmaCallback;
-    apiRetStatus = CyU3PDmaChannelCreate (&glDmaChHandle, CY_U3P_DMA_TYPE_MANUAL_OUT, &dmaCfg); //CY_U3P_DMA_TYPE_AUTO_SIGNAL
+    dmaCfg.cb = NULL;
+    apiRetStatus = CyU3PDmaChannelCreate (&glUsbChannel, CY_U3P_DMA_TYPE_MANUAL_OUT, &dmaCfg);
+
+
+	CyU3PDebugPrint(4,
+    	"DMA config:\r\n"
+    	"  prodSckId: %d\r\n"
+    	"  consSckId: %d\r\n"
+    	"  size: %d\r\n"
+    	"  count: %d\r\n"
+    	"  dmaMode: %d\r\n"
+    	"  prodHeader: %d\r\n"
+    	"  consHeader: %d\r\n"
+    	"  prodFooter: %d\r\n"
+    	"  prodAvailCount: %d\r\n"
+		"  cb: %d\r\n"
+    	"\r\n",
+    	dmaCfg.prodSckId, dmaCfg.consSckId, dmaCfg.size, dmaCfg.count,
+    	dmaCfg.dmaMode, dmaCfg.prodHeader, dmaCfg.consHeader,
+    	dmaCfg.prodFooter, dmaCfg.prodAvailCount, dmaCfg.cb);
 
 
 
@@ -303,7 +344,7 @@ CyFxApplnStart (uint16_t samplingFactor)
     }
 
     /* Set DMA Channel transfer size */
-    apiRetStatus = CyU3PDmaChannelSetXfer (&glDmaChHandle, CY_FX_GPIFTOUSB_DMA_TX_SIZE);
+    apiRetStatus = CyU3PDmaChannelSetXfer (&glUsbChannel, CY_FX_GPIFTOUSB_DMA_TX_SIZE);
     if (apiRetStatus != CY_U3P_SUCCESS)
     {
         CyU3PDebugPrint (4, "CyU3PDmaChannelSetXfer failed, Error code = %d\n", apiRetStatus);
@@ -347,7 +388,7 @@ CyFxApplnStop (
     CyU3PPibDeInit();
 
     /* Destroy the channels */
-    CyU3PDmaChannelDestroy (&glDmaChHandle);
+    CyU3PDmaChannelDestroy (&glUsbChannel); //glDmaChHandle
 
     /* Flush the endpoint memory */
     CyU3PUsbFlushEp(CY_FX_EP_CONSUMER);
@@ -421,7 +462,6 @@ CyFxApplnUSBSetupCB (
                 /*glEp0Buffer[0] should be the factor by which the 400MHZ clock should be divided*/
                 CyFxApplnStart(glEp0Buffer[0]);
             	isHandled = CyTrue;
-            	CyU3PDmaChannelSetXfer(&glDmaChHandle, 0);
                 break;
 
             case CMD_GET_FW_VERSION:
@@ -706,15 +746,19 @@ CyFxApplnInit (void)
 
 void printGpifToUSBDMAStats()
 {
-	CyU3PDebugPrint(0,"Prod:%d , Cons:%d\r\n",glProdCount,glConsCount);
+	CyU3PDebugPrint(0, "Prod:%d , Cons:%d, LastType:%d\r\n", glProdCount, glConsCount, lastEvent);
 	glProdCount = 0;
 	glConsCount = 0;
+	lastEvent = 0;
 }
 
 /* Entry function for the glAppThread. */
 void
-CyFxAppThread_Entry (uint32_t input)
+CyFxAppThread_Entry (
+        uint32_t input)
 {
+	CyU3PReturnStatus_t stat;
+	CyU3PDmaBuffer_t dmaBuf;
     /* Initialize the debug module */
     CyFxApplnDebugInit();
 
@@ -725,53 +769,51 @@ CyFxAppThread_Entry (uint32_t input)
     while (!glIsApplnActive)
         CyU3PThreadSleep (100);
 
-    CyU3PDebugPrint(4, "Entered AppThread main loop!\n");
+    CyU3PThreadSleep(100);
+
+    /* Pre-fill a few USB DMA buffers with constant value 128 (0x80) */
+      for (int i = 0; i < 3; i++)
+      {
+          stat = CyU3PDmaChannelGetBuffer(&glUsbChannel, &dmaBuf, CYU3P_NO_WAIT);
+          if (stat == CY_U3P_SUCCESS)
+          {
+              CyU3PMemSet(dmaBuf.buffer, 0x64, dmaBuf.size);
+              CyU3PDmaChannelCommitBuffer(&glUsbChannel, dmaBuf.size, 0);
+          }
+      }
+
     for (;;)
     {
-
-    	 printGpifToUSBDMAStats();  // Optional debug
-    	 CyU3PThreadSleep(1000);    // Adjust timing as needed
-
-//        if(glIsApplnActive && (glProdCount + glConsCount > 0))
+//        if(glIsApplnActive && (glProdCount + glConsCount > 0 || lastEvent != 0))
 //        {
 //        	printGpifToUSBDMAStats();
 //        }
 //        CyU3PThreadSleep (10);
+
+
+        CyU3PDmaBuffer_t dmaBuf;
+        stat = CyU3PDmaChannelGetBuffer(&glUsbChannel, &dmaBuf, CYU3P_WAIT_FOREVER);
+        if (stat != CY_U3P_SUCCESS)
+        {
+            CyU3PDebugPrint(2, "Buffer get failed: %d\r\n", stat);
+            continue;
+        }
+
+        /* Fill the buffer with 0x80 (128 decimal) */
+        CyU3PMemSet(dmaBuf.buffer, 0x64, dmaBuf.size);
+
+        /* Commit the buffer */
+        stat = CyU3PDmaChannelCommitBuffer(&glUsbChannel, dmaBuf.size, 0);
+        if (stat != CY_U3P_SUCCESS)
+        {
+            CyU3PDebugPrint(2, "Buffer commit failed: %d\r\n", stat);
+            continue;
+        }
+        CyU3PThreadSleep (10);
+
     }
-
-
-//    for (;;){
-//    	if (glIsApplnActive) {
-//            CyU3PDmaBuffer_t dmaBuf;
-//            CyU3PReturnStatus_t status;
-//
-//            status = CyU3PDmaChannelGetBuffer(&glDmaChHandle, &dmaBuf, CYU3P_NO_WAIT);
-//            // CYU3P_WAIT_FOREVER
-//            if (status != CY_U3P_SUCCESS)
-//            {
-//            	CyU3PDebugPrint(4, "DMA buffer not ready: 0x%x\n", status);
-//            }
-//            else
-//            {
-//                CyU3PDebugPrint(4, "Got DMA buffer at %p, size=%d\n", dmaBuf.buffer, dmaBuf.size);
-//
-//                // Send a constant voltage value (e.g., 1.65V out of 3.3V = half scale = 128)
-//                uint8_t constant_adc_value = 128;  // Half scale
-//                for (int i = 0; i < dmaBuf.size; ++i) {
-//                    dmaBuf.buffer[i] = constant_adc_value;
-//                }
-//
-//                dmaBuf.count = dmaBuf.size;
-//                dmaBuf.status = 0;
-//
-//                CyU3PDmaChannelCommitBuffer(&glDmaChHandle, dmaBuf.count, 0);
-//                CyU3PDebugPrint(4, "Committed %d constant bytes to USB\n", dmaBuf.count);
-//            }
-//        }
-//
-//    CyU3PThreadSleep(10);  // Throttle for timing
-//    }
 }
+
 
 
 /* Application define function which creates the threads. */

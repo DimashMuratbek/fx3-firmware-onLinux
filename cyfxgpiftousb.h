@@ -60,12 +60,12 @@
 
 /* Size of DMA buffers used by the application. */
 #ifndef CY_FX_DMA_BUF_SIZE
-#define CY_FX_DMA_BUF_SIZE              (1024 * 32)  /* Increased for 32 channels */
+#define CY_FX_DMA_BUF_SIZE              (512)  /* 4096 Increased for 32 channels */
 #endif
 
 /* Number of DMA buffers to be used on the channel. */
 #ifndef CY_FX_DMA_BUF_COUNT
-#define CY_FX_DMA_BUF_COUNT             (8)          /* Increased buffer count for better buffering */
+#define CY_FX_DMA_BUF_COUNT             (4)          /* Increased buffer count for better buffering */
 #endif
 
 /* Parameters for loop-back function. */
